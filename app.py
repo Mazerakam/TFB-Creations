@@ -21,15 +21,15 @@ def after_request(response):
 # ===================== CONFIG PRIX =====================
 PRIX_KG = {"PLA": 25.0, "PETG": 28.0, "TPU": 35.0}
 DENSITE = {"PLA": 1.24, "PETG": 1.27, "TPU": 1.20}
-REMPLISSAGE      = 0.30
-EPAISSEUR_COQUE  = 0.12
+REMPLISSAGE       = 0.30
+EPAISSEUR_COQUE   = 0.12
 COEFFICIENT_MARGE = 3.5
-FORFAIT_MACHINE  = 2.0
-PRIX_MIN         = 5.0
+FORFAIT_MACHINE   = 2.0
+PRIX_MIN          = 5.0
 
 # ===================== CONFIG SHOPIFY =====================
-SHOPIFY_STORE    = "tf-b-creations.myshopify.com"
-SHOPIFY_TOKEN    = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")  # Variable d'env sur Render
+SHOPIFY_STORE = "tf-b-creations.myshopify.com"
+SHOPIFY_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")
 
 # ===================== ROUTES =====================
 
@@ -44,18 +44,18 @@ def analyze():
         return "", 200
 
     if "file" not in request.files:
-        return jsonify({"error": "Aucun fichier reçu"}), 400
+        return jsonify({"error": "Aucun fichier recu"}), 400
 
     f = request.files["file"]
     materiau = request.form.get("materiau", "PLA").upper()
     echelle  = float(request.form.get("echelle", 1.0))
 
     if materiau not in DENSITE:
-        return jsonify({"error": f"Matériau inconnu : {materiau}"}), 400
+        return jsonify({"error": f"Materiau inconnu : {materiau}"}), 400
 
     suffix = os.path.splitext(f.filename)[1].lower()
     if suffix not in [".stl", ".3mf"]:
-        return jsonify({"error": "Format non supporté. Utilisez .stl ou .3mf"}), 400
+        return jsonify({"error": "Format non supporte. Utilisez .stl ou .3mf"}), 400
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         f.save(tmp.name)
@@ -67,9 +67,9 @@ def analyze():
             trimesh.repair.fix_normals(mesh)
             trimesh.repair.fill_holes(mesh)
 
-        volume_mm3  = abs(mesh.volume)
-        volume_cm3  = volume_mm3 / 1000.0 * (echelle ** 3)
-        surface_cm2 = mesh.area / 100.0
+        volume_mm3     = abs(mesh.volume)
+        volume_cm3     = volume_mm3 / 1000.0 * (echelle ** 3)
+        surface_cm2    = mesh.area / 100.0
         volume_coque   = surface_cm2 * EPAISSEUR_COQUE
         volume_imprime = (volume_cm3 * REMPLISSAGE) + volume_coque
         poids_g        = volume_imprime * DENSITE[materiau]
@@ -106,29 +106,18 @@ def create_order():
         return "", 200
 
     if not SHOPIFY_TOKEN:
-        return jsonify({"error": "Token Shopify non configuré sur le serveur"}), 500
+        return jsonify({"error": "Token Shopify non configure sur le serveur"}), 500
 
     data = request.get_json()
     if not data:
-        return jsonify({"error": "Données manquantes"}), 400
+        return jsonify({"error": "Donnees manquantes"}), 400
 
-    # Champs attendus
-    fichier    = data.get("fichier", "—")
-    lien       = data.get("lien", "—")
+    fichier    = data.get("fichier", "-")
+    lien       = data.get("lien", "-")
     materiau   = data.get("materiau", "PLA")
-    couleur    = data.get("couleur", "—")
-    dimensions = data.get("dimensions", "—")
+    couleur    = data.get("couleur", "-")
+    dimensions = data.get("dimensions", "-")
     prix       = float(data.get("prix", 5.0))
-    email      = data.get("email", "")
-
-    # Construire le Draft Order Shopify
-    note_lines = [
-        f"📄 Fichier : {fichier}",
-        f"📎 Lien fichier : {lien}",
-        f"🧱 Matériau : {materiau}",
-        f"🎨 Couleur : {couleur}",
-        f"📐 Dimensions : {dimensions}",
-    ]
 
     draft_order = {
         "draft_order": {
@@ -138,23 +127,18 @@ def create_order():
                 "quantity": 1,
                 "requires_shipping": True,
                 "properties": [
-                    {"name": "📄 Fichier",      "value": fichier},
-                    {"name": "📎 Lien fichier", "value": lien},
-                    {"name": "🧱 Matériau",     "value": materiau},
-                    {"name": "🎨 Couleur",      "value": couleur},
-                    {"name": "📐 Dimensions",   "value": dimensions},
+                    {"name": "Fichier",      "value": fichier},
+                    {"name": "Lien fichier", "value": lien},
+                    {"name": "Materiau",     "value": materiau},
+                    {"name": "Couleur",      "value": couleur},
+                    {"name": "Dimensions",   "value": dimensions},
                 ]
             }],
-            "note": "\n".join(note_lines),
+            "note": f"Fichier: {fichier}\nLien: {lien}\nMateriau: {materiau}\nCouleur: {couleur}\nDimensions: {dimensions}",
             "tags": "impression-3d-custom",
-            "use_customer_default_address": False,
         }
     }
 
-    if email:
-        draft_order["draft_order"]["email"] = email
-
-    # Appel Admin API Shopify
     url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/draft_orders.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_TOKEN,
@@ -162,38 +146,24 @@ def create_order():
     }
 
     try:
-        resp = requests.post(url, json=draft_order, headers=headers, timeout=15)
-        resp_data = resp.json()
-
-        if resp.status_code != 201:
-            return jsonify({
-                "error": "Erreur Shopify",
-                "details": resp_data
-            }), resp.status_code
+        body = json_lib.dumps(draft_order).encode("utf-8")
+        req  = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp_data = json_lib.loads(r.read().decode())
 
         invoice_url = resp_data["draft_order"].get("invoice_url", "")
-        order_id    = resp_data["draft_order"].get("id", "")
         order_name  = resp_data["draft_order"].get("name", "")
 
-        # Envoyer la facture par email si fourni
-        if email and invoice_url:
-            invoice_url_api = f"https://{SHOPIFY_STORE}/admin/api/2024-01/draft_orders/{order_id}/send_invoice.json"
-            requests.post(invoice_url_api, json={
-                "draft_order_invoice": {
-                    "to": email,
-                    "subject": f"Votre devis impression 3D — {order_name}",
-                    "custom_message": f"Bonjour,\n\nVoici votre lien de paiement pour votre impression 3D sur mesure ({dimensions}, {materiau}, {couleur}).\n\nMerci de votre confiance !\nTechFix & Build"
-                }
-            }, headers=headers, timeout=10)
-
         return jsonify({
-            "success": True,
+            "success":     True,
             "invoice_url": invoice_url,
-            "order_name": order_name,
+            "order_name":  order_name,
         })
 
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": "Erreur Shopify", "details": e.read().decode()}), e.code
     except Exception as e:
-        return jsonify({"error": f"Erreur réseau : {str(e)}"}), 500
+        return jsonify({"error": f"Erreur reseau : {str(e)}"}), 500
 
 
 if __name__ == "__main__":
