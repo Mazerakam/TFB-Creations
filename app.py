@@ -8,28 +8,12 @@ import uuid
 import urllib.request
 import urllib.error
 import json as json_lib
-from datetime import datetime, timedelta
-from collections import defaultdict
-import threading
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-# ===================== RATE LIMITING MANUEL =====================
-_rate_lock    = threading.Lock()
-_rate_store   = defaultdict(list)   # ip → [datetime, ...]
-RATE_LIMIT    = 3       # requêtes max
-RATE_WINDOW   = 3600    # secondes (1 heure)
 
-def is_rate_limited(ip):
-    now = datetime.utcnow()
-    cutoff = now - timedelta(seconds=RATE_WINDOW)
-    with _rate_lock:
-        _rate_store[ip] = [t for t in _rate_store[ip] if t > cutoff]
-        if len(_rate_store[ip]) >= RATE_LIMIT:
-            return True
-        _rate_store[ip].append(now)
-        return False
 
 @app.after_request
 def after_request(response):
@@ -182,10 +166,6 @@ def index():
 def analyze():
     if request.method == "OPTIONS":
         return "", 200
-
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-    if is_rate_limited(ip):
-        return jsonify({"error": "Trop d'analyses effectuées. Réessayez dans une heure."}), 429
 
     if "file" not in request.files:
         return jsonify({"error": "Aucun fichier recu"}), 400
