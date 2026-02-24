@@ -116,6 +116,7 @@ def create_order():
     lien       = data.get("lien", "-")
     materiau   = data.get("materiau", "PLA")
     couleur    = data.get("couleur", "-")
+    plaque     = data.get("plaque", "Aucune (lisse)")
     dimensions = data.get("dimensions", "-")
     prix       = float(data.get("prix", 5.0))
 
@@ -131,10 +132,11 @@ def create_order():
                     {"name": "Lien fichier", "value": lien},
                     {"name": "Materiau",     "value": materiau},
                     {"name": "Couleur",      "value": couleur},
+                    {"name": "Plaque",       "value": plaque},
                     {"name": "Dimensions",   "value": dimensions},
                 ]
             }],
-            "note": f"Fichier: {fichier}\nLien: {lien}\nMateriau: {materiau}\nCouleur: {couleur}\nDimensions: {dimensions}",
+            "note": f"Fichier: {fichier}\nLien: {lien}\nMateriau: {materiau}\nCouleur: {couleur}\nPlaque: {plaque}\nDimensions: {dimensions}",
             "tags": "impression-3d-custom",
         }
     }
