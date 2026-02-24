@@ -1,7 +1,5 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 import trimesh
 import numpy as np
 import tempfile
@@ -10,18 +8,28 @@ import uuid
 import urllib.request
 import urllib.error
 import json as json_lib
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import defaultdict
+import threading
 
 app = Flask(__name__)
 CORS(app)
 
-# ===================== RATE LIMITING =====================
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=[],
-    storage_uri="memory://"
-)
+# ===================== RATE LIMITING MANUEL =====================
+_rate_lock    = threading.Lock()
+_rate_store   = defaultdict(list)   # ip → [datetime, ...]
+RATE_LIMIT    = 3       # requêtes max
+RATE_WINDOW   = 3600    # secondes (1 heure)
+
+def is_rate_limited(ip):
+    now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=RATE_WINDOW)
+    with _rate_lock:
+        _rate_store[ip] = [t for t in _rate_store[ip] if t > cutoff]
+        if len(_rate_store[ip]) >= RATE_LIMIT:
+            return True
+        _rate_store[ip].append(now)
+        return False
 
 @app.after_request
 def after_request(response):
@@ -171,10 +179,13 @@ def index():
 
 
 @app.route("/analyze", methods=["POST", "OPTIONS"])
-@limiter.limit("3 per hour", error_message="Trop d'analyses effectuées. Réessayez dans une heure.")
 def analyze():
     if request.method == "OPTIONS":
         return "", 200
+
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if is_rate_limited(ip):
+        return jsonify({"error": "Trop d'analyses effectuées. Réessayez dans une heure."}), 429
 
     if "file" not in request.files:
         return jsonify({"error": "Aucun fichier recu"}), 400
