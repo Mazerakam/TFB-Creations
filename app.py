@@ -4,7 +4,9 @@ import trimesh
 import numpy as np
 import tempfile
 import os
-import requests
+import urllib.request
+import urllib.error
+import json as json_lib
 
 app = Flask(__name__)
 CORS(app)
