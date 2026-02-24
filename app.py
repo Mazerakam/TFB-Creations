@@ -1,15 +1,27 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import trimesh
 import numpy as np
 import tempfile
 import os
+import uuid
 import urllib.request
 import urllib.error
 import json as json_lib
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
+
+# ===================== RATE LIMITING =====================
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=[],
+    storage_uri="memory://"
+)
 
 @app.after_request
 def after_request(response):
@@ -19,17 +31,137 @@ def after_request(response):
     return response
 
 # ===================== CONFIG PRIX =====================
-PRIX_KG = {"PLA": 25.0, "PETG": 28.0, "TPU": 35.0}
-DENSITE = {"PLA": 1.24, "PETG": 1.27, "TPU": 1.20}
-REMPLISSAGE       = 0.30
+PRIX_KG = {"PLA": 25.0, "PETG": 28.0, "TPU": 35.0, "ASA": 28.0}
+DENSITE = {"PLA": 1.24, "PETG": 1.27, "TPU": 1.20, "ASA": 1.07}
+
+# Vitesse d'extrusion estimée par matériau (mm³/s) — sert au calcul du temps
+VITESSE_MM3_S = {"PLA": 8.0, "PETG": 6.5, "TPU": 3.5, "ASA": 6.0}
+
+REMPLISSAGE       = 0.20   # 20% infill
 EPAISSEUR_COQUE   = 0.12
-COEFFICIENT_MARGE = 3.5
-FORFAIT_MACHINE   = 2.0
-PRIX_MIN          = 5.0
+PRIX_HEURE_MACHINE = 1.50  # €/heure d'impression
+COEFFICIENT_MARGE  = 1.40  # 40% de marge
+PRIX_MIN           = 3.0   # plancher absolu
+
+# Plateau Anycubic Kobra MAX
+PLATEAU = {"x": 250.0, "y": 250.0, "z": 250.0}
 
 # ===================== CONFIG SHOPIFY =====================
 SHOPIFY_STORE = "tf-b-creations.myshopify.com"
 SHOPIFY_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")
+
+# ===================== CONFIG CLOUDFLARE R2 =====================
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
+R2_BUCKET     = os.environ.get("R2_BUCKET", "tfb-stl-files")
+
+def get_r2_client():
+    """Retourne un client boto3 compatible R2. Retourne None si non configuré."""
+    if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY, R2_SECRET_KEY]):
+        return None
+    try:
+        import boto3
+        return boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            region_name="auto"
+        )
+    except ImportError:
+        print("boto3 non installé — upload R2 désactivé")
+        return None
+
+def upload_stl_r2(file_bytes, original_filename):
+    """Upload un fichier STL vers R2. Retourne la clé ou None si échec."""
+    client = get_r2_client()
+    if not client:
+        return None
+    try:
+        date_str  = datetime.now().strftime("%Y%m%d")
+        unique_id = str(uuid.uuid4())[:8]
+        key       = f"{date_str}/{unique_id}_{original_filename}"
+        client.put_object(
+            Bucket=R2_BUCKET,
+            Key=key,
+            Body=file_bytes,
+            ContentType="application/octet-stream",
+            Metadata={"original_name": original_filename}
+        )
+        return key
+    except Exception as e:
+        print(f"R2 upload failed: {e}")
+        return None
+
+# ===================== CALCUL PRIX =====================
+
+def calculer_prix(mesh, materiau, echelle=1.0):
+    """
+    Calcule le prix en croisant :
+    - poids (matière × infill)
+    - temps d'impression estimé (volume / vitesse extrusion)
+    - occupation du plateau (supplément si >60%)
+    - warnings si hors plateau
+    """
+    densite    = DENSITE.get(materiau, 1.24)
+    vitesse    = VITESSE_MM3_S.get(materiau, 8.0)
+    prix_kg    = PRIX_KG.get(materiau, 25.0)
+
+    # — Dimensions & vérification plateau —
+    bounds  = mesh.bounds
+    dims_mm = (bounds[1] - bounds[0]) * echelle
+    warnings = []
+    for axe, val, maxi in zip(["X", "Y", "Z"], dims_mm, [PLATEAU["x"], PLATEAU["y"], PLATEAU["z"]]):
+        if val > maxi:
+            warnings.append(f"Dimension {axe} ({val:.0f} mm) dépasse le plateau max ({int(maxi)} mm)")
+
+    # — Volume —
+    volume_mm3     = abs(mesh.volume) * (echelle ** 3)
+    volume_cm3     = volume_mm3 / 1000.0
+    surface_cm2    = (mesh.area * (echelle ** 2)) / 100.0
+    volume_coque   = surface_cm2 * EPAISSEUR_COQUE
+    volume_imprime = (volume_cm3 * REMPLISSAGE) + volume_coque  # cm³ de matière réelle
+
+    # — Poids —
+    poids_g = volume_imprime * densite
+
+    # — Temps d'impression (volume mm³ de matière / vitesse mm³/s) —
+    volume_mat_mm3  = volume_imprime * 1000.0   # cm³ → mm³
+    temps_secondes  = volume_mat_mm3 / vitesse
+    temps_heures    = temps_secondes / 3600.0
+    temps_label     = f"{int(temps_heures)}h{int((temps_heures % 1) * 60):02d}"
+
+    # — Surface plateau (empreinte XY) —
+    surface_xy      = dims_mm[0] * dims_mm[1]
+    surface_max     = PLATEAU["x"] * PLATEAU["y"]
+    ratio_plateau   = surface_xy / surface_max
+    suppl_plateau   = 0.50 if ratio_plateau > 0.60 else 0.0
+
+    # — Coûts —
+    cout_matiere = (poids_g / 1000.0) * prix_kg
+    cout_machine = temps_heures * PRIX_HEURE_MACHINE
+
+    # — Prix final —
+    prix_brut  = (cout_matiere + cout_machine + suppl_plateau) * COEFFICIENT_MARGE
+    prix_final = max(round(prix_brut, 2), PRIX_MIN)
+
+    return {
+        "prix_final_eur":       prix_final,
+        "prix_filament_eur":    round(cout_matiere, 2),
+        "poids_g":              round(poids_g, 1),
+        "volume_cm3":           round(volume_cm3, 2),
+        "volume_imprime_cm3":   round(volume_imprime, 2),
+        "temps_impression":     temps_label,
+        "surface_plateau_pct":  round(ratio_plateau * 100, 1),
+        "materiau":             materiau,
+        "dimensions_mm": {
+            "largeur":    round(dims_mm[0], 1),
+            "profondeur": round(dims_mm[1], 1),
+            "hauteur":    round(dims_mm[2], 1),
+        },
+        "warnings": warnings,
+    }
 
 # ===================== ROUTES =====================
 
@@ -39,6 +171,7 @@ def index():
 
 
 @app.route("/analyze", methods=["POST", "OPTIONS"])
+@limiter.limit("3 per hour", error_message="Trop d'analyses effectuées. Réessayez dans une heure.")
 def analyze():
     if request.method == "OPTIONS":
         return "", 200
@@ -46,7 +179,7 @@ def analyze():
     if "file" not in request.files:
         return jsonify({"error": "Aucun fichier recu"}), 400
 
-    f = request.files["file"]
+    f        = request.files["file"]
     materiau = request.form.get("materiau", "PLA").upper()
     echelle  = float(request.form.get("echelle", 1.0))
 
@@ -57,8 +190,14 @@ def analyze():
     if suffix not in [".stl", ".3mf"]:
         return jsonify({"error": "Format non supporte. Utilisez .stl ou .3mf"}), 400
 
+    # Lire les bytes une seule fois (pour upload R2 + analyse)
+    file_bytes = f.read()
+
+    # Upload R2 en arrière-plan (non bloquant si échec)
+    r2_key = upload_stl_r2(file_bytes, f.filename)
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        f.save(tmp.name)
+        tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
@@ -67,32 +206,11 @@ def analyze():
             trimesh.repair.fix_normals(mesh)
             trimesh.repair.fill_holes(mesh)
 
-        volume_mm3     = abs(mesh.volume)
-        volume_cm3     = volume_mm3 / 1000.0 * (echelle ** 3)
-        surface_cm2    = mesh.area / 100.0
-        volume_coque   = surface_cm2 * EPAISSEUR_COQUE
-        volume_imprime = (volume_cm3 * REMPLISSAGE) + volume_coque
-        poids_g        = volume_imprime * DENSITE[materiau]
-        prix_filament  = (poids_g / 1000.0) * PRIX_KG[materiau]
-        prix_final     = max((prix_filament * COEFFICIENT_MARGE) + FORFAIT_MACHINE, PRIX_MIN)
+        result = calculer_prix(mesh, materiau, echelle)
+        result["watertight"] = mesh.is_watertight
+        result["r2_key"]     = r2_key  # None si R2 non configuré
 
-        bounds  = mesh.bounds
-        dims_mm = ((bounds[1] - bounds[0]) * echelle).tolist()
-
-        return jsonify({
-            "volume_cm3":         round(volume_cm3, 2),
-            "volume_imprime_cm3": round(volume_imprime, 2),
-            "poids_g":            round(poids_g, 1),
-            "materiau":           materiau,
-            "prix_filament_eur":  round(prix_filament, 2),
-            "prix_final_eur":     round(prix_final, 2),
-            "dimensions_mm": {
-                "largeur":    round(dims_mm[0], 1),
-                "profondeur": round(dims_mm[1], 1),
-                "hauteur":    round(dims_mm[2], 1),
-            },
-            "watertight": mesh.is_watertight,
-        })
+        return jsonify(result)
 
     except Exception as e:
         return jsonify({"error": f"Erreur analyse : {str(e)}"}), 500
@@ -112,36 +230,61 @@ def create_order():
     if not data:
         return jsonify({"error": "Donnees manquantes"}), 400
 
-    fichier    = data.get("fichier", "-")
-    lien       = data.get("lien", "-")
-    materiau   = data.get("materiau", "PLA")
-    couleur    = data.get("couleur", "-")
-    plaque     = data.get("plaque", "Aucune (lisse)")
-    dimensions = data.get("dimensions", "-")
-    prix       = float(data.get("prix", 5.0))
+    fichier           = data.get("fichier", "-")
+    lien              = data.get("lien", "-")
+    materiau          = data.get("materiau", "PLA")
+    couleur           = data.get("couleur", "-")
+    plaque            = data.get("plaque", "Aucune (lisse)")
+    finition          = data.get("finition", "Impression brute")
+    dimensions        = data.get("dimensions", "-")
+    temps_impression  = data.get("temps_impression", "-")
+    surface_plateau   = data.get("surface_plateau_pct", "-")
+    commentaire       = data.get("commentaire", "")
+    r2_key            = data.get("r2_key", "-")
+    prix              = float(data.get("prix", 3.0))
+
+    note = "\n".join([
+        f"Fichier       : {fichier}",
+        f"Lien STL      : {lien}",
+        f"Fichier R2    : {r2_key}",
+        f"Matériau      : {materiau}",
+        f"Couleur       : {couleur}",
+        f"Plaque        : {plaque}",
+        f"Finition      : {finition}",
+        f"Dimensions    : {dimensions}",
+        f"Temps estimé  : {temps_impression}",
+        f"Surface plat. : {surface_plateau}%",
+        *([ f"Commentaire   : {commentaire}" ] if commentaire else []),
+    ])
 
     draft_order = {
         "draft_order": {
             "line_items": [{
-                "title": "Impression 3D sur mesure",
+                "title": f"Impression 3D sur mesure — {materiau}",
                 "price": str(round(prix, 2)),
                 "quantity": 1,
                 "requires_shipping": True,
                 "properties": [
-                    {"name": "Fichier",      "value": fichier},
-                    {"name": "Lien fichier", "value": lien},
-                    {"name": "Materiau",     "value": materiau},
-                    {"name": "Couleur",      "value": couleur},
-                    {"name": "Plaque",       "value": plaque},
-                    {"name": "Dimensions",   "value": dimensions},
+                    {"name": "Fichier",          "value": fichier},
+                    {"name": "Lien fichier",      "value": lien},
+                    {"name": "Matériau",          "value": materiau},
+                    {"name": "Couleur",           "value": couleur},
+                    {"name": "Plaque",            "value": plaque},
+                    {"name": "Finition",          "value": finition},
+                    {"name": "Dimensions",        "value": dimensions},
+                    {"name": "Temps impression",  "value": temps_impression},
+                    {"name": "Surface plateau",   "value": f"{surface_plateau}%"},
+                    {"name": "Fichier R2",        "value": r2_key or "-"},
+                    *([ {"name": "Commentaire", "value": commentaire} ] if commentaire else []),
                 ]
             }],
-            "note": f"Fichier: {fichier}\nLien: {lien}\nMateriau: {materiau}\nCouleur: {couleur}\nPlaque: {plaque}\nDimensions: {dimensions}",
-            "tags": "impression-3d-custom",
+            "note": note,
+            "tags": "impression-3d-custom,a-valider",
+            # Pas de send_receipt ni complete → reste en brouillon à valider manuellement
         }
     }
 
-    url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/draft_orders.json"
+    url     = f"https://{SHOPIFY_STORE}/admin/api/2024-01/draft_orders.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_TOKEN,
         "Content-Type": "application/json",
