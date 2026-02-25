@@ -86,20 +86,19 @@ def upload_stl_r2(file_bytes, original_filename):
 
 def load_mesh(tmp_path, suffix):
     """
-    Charge un fichier STL ou 3MF et retourne un trimesh.Trimesh unique.
-    - STL  : chargement direct
-    - 3MF  : retourne une Scene → on fusionne tous les géométries en un seul mesh
+    Charge un fichier STL, 3MF ou OBJ et retourne un trimesh.Trimesh unique.
+    force='mesh' court-circuite le graphe de scène (pas besoin de networkx).
     """
-    loaded = trimesh.load(tmp_path)
+    loaded = trimesh.load(tmp_path, force='mesh')
 
-    # Cas Scene (3MF multi-objets ou STL groupé)
-    if isinstance(loaded, trimesh.Scene):
+    if isinstance(loaded, trimesh.Trimesh):
+        mesh = loaded
+    elif isinstance(loaded, trimesh.Scene):
+        # Fallback au cas où force='mesh' retourne quand même une Scene
         meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if not meshes:
             raise ValueError("Aucune géométrie valide trouvée dans le fichier.")
         mesh = trimesh.util.concatenate(meshes)
-    elif isinstance(loaded, trimesh.Trimesh):
-        mesh = loaded
     else:
         raise ValueError(f"Format non reconnu : {type(loaded)}")
 
@@ -195,8 +194,8 @@ def analyze():
         return jsonify({"error": f"Materiau inconnu : {materiau}"}), 400
 
     suffix = os.path.splitext(f.filename)[1].lower()
-    if suffix not in [".stl", ".3mf"]:
-        return jsonify({"error": "Format non supporte. Utilisez .stl ou .3mf"}), 400
+    if suffix not in [".stl", ".3mf", ".obj"]:
+        return jsonify({"error": "Format non supporte. Utilisez .stl, .3mf ou .obj"}), 400
 
     file_bytes = f.read()
     r2_key     = upload_stl_r2(file_bytes, f.filename)
