@@ -84,25 +84,80 @@ def upload_stl_r2(file_bytes, original_filename):
 
 # ===================== CHARGEMENT MESH =====================
 
+def load_mesh_3mf(tmp_path):
+    """
+    Parse un .3mf manuellement (ZIP + XML) sans dépendance externe.
+    Retourne un trimesh.Trimesh construit depuis les vertices/faces extraits.
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    ns = {"m": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
+
+    all_vertices = []
+    all_faces    = []
+    vertex_offset = 0
+
+    with zipfile.ZipFile(tmp_path, "r") as zf:
+        # Cherche tous les fichiers .model dans le ZIP
+        model_files = [n for n in zf.namelist() if n.endswith(".model")]
+        if not model_files:
+            raise ValueError("Aucun fichier .model trouvé dans le .3mf")
+
+        for model_file in model_files:
+            tree = ET.fromstring(zf.read(model_file))
+            for mesh_el in tree.findall(".//m:mesh", ns):
+                verts_el = mesh_el.find("m:vertices", ns)
+                tris_el  = mesh_el.find("m:triangles", ns)
+                if verts_el is None or tris_el is None:
+                    continue
+
+                for v in verts_el.findall("m:vertex", ns):
+                    all_vertices.append([
+                        float(v.get("x", 0)),
+                        float(v.get("y", 0)),
+                        float(v.get("z", 0)),
+                    ])
+
+                for t in tris_el.findall("m:triangle", ns):
+                    all_faces.append([
+                        int(t.get("v1")) + vertex_offset,
+                        int(t.get("v2")) + vertex_offset,
+                        int(t.get("v3")) + vertex_offset,
+                    ])
+
+                vertex_offset += len(verts_el.findall("m:vertex", ns))
+
+    if not all_vertices or not all_faces:
+        raise ValueError("Aucune géométrie valide trouvée dans le .3mf")
+
+    return trimesh.Trimesh(
+        vertices=np.array(all_vertices, dtype=np.float64),
+        faces=np.array(all_faces,    dtype=np.int64),
+        process=True
+    )
+
+
 def load_mesh(tmp_path, suffix):
     """
-    Charge un fichier STL, 3MF ou OBJ et retourne un trimesh.Trimesh unique.
-    force='mesh' court-circuite le graphe de scène (pas besoin de networkx).
+    Charge STL, 3MF ou OBJ et retourne un trimesh.Trimesh unique.
+    - .3mf : parser manuel (pas de networkx)
+    - .stl / .obj : trimesh direct avec force='mesh'
     """
-    loaded = trimesh.load(tmp_path, force='mesh')
-
-    if isinstance(loaded, trimesh.Trimesh):
-        mesh = loaded
-    elif isinstance(loaded, trimesh.Scene):
-        # Fallback au cas où force='mesh' retourne quand même une Scene
-        meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        if not meshes:
-            raise ValueError("Aucune géométrie valide trouvée dans le fichier.")
-        mesh = trimesh.util.concatenate(meshes)
+    if suffix == ".3mf":
+        mesh = load_mesh_3mf(tmp_path)
     else:
-        raise ValueError(f"Format non reconnu : {type(loaded)}")
+        loaded = trimesh.load(tmp_path, force='mesh')
+        if isinstance(loaded, trimesh.Trimesh):
+            mesh = loaded
+        elif isinstance(loaded, trimesh.Scene):
+            meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+            if not meshes:
+                raise ValueError("Aucune géométrie valide trouvée dans le fichier.")
+            mesh = trimesh.util.concatenate(meshes)
+        else:
+            raise ValueError(f"Format non reconnu : {type(loaded)}")
 
-    # Réparation légère si nécessaire
     if not mesh.is_watertight:
         trimesh.repair.fix_normals(mesh)
         trimesh.repair.fill_holes(mesh)
