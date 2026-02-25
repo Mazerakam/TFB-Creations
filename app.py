@@ -13,8 +13,6 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
-
-
 @app.after_request
 def after_request(response):
     response.headers.add("Access-Control-Allow-Origin", "*")
@@ -29,11 +27,11 @@ DENSITE = {"PLA": 1.24, "PETG": 1.27, "TPU": 1.20, "ASA": 1.07}
 # Vitesse d'extrusion estimée par matériau (mm³/s) — sert au calcul du temps
 VITESSE_MM3_S = {"PLA": 8.0, "PETG": 6.5, "TPU": 3.5, "ASA": 6.0}
 
-REMPLISSAGE       = 0.20   # 20% infill
-EPAISSEUR_COQUE   = 0.12
-PRIX_HEURE_MACHINE = 1.50  # €/heure d'impression
-COEFFICIENT_MARGE  = 1.40  # 40% de marge
-PRIX_MIN           = 3.0   # plancher absolu
+REMPLISSAGE        = 0.20   # 20% infill
+EPAISSEUR_COQUE    = 0.12
+PRIX_HEURE_MACHINE = 1.50   # €/heure d'impression
+COEFFICIENT_MARGE  = 1.40   # 40% de marge
+PRIX_MIN           = 3.0    # plancher absolu
 
 # Plateau Anycubic Kobra MAX
 PLATEAU = {"x": 250.0, "y": 250.0, "z": 250.0}
@@ -49,7 +47,6 @@ R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET     = os.environ.get("R2_BUCKET", "tfb-stl-files")
 
 def get_r2_client():
-    """Retourne un client boto3 compatible R2. Retourne None si non configuré."""
     if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY, R2_SECRET_KEY]):
         return None
     try:
@@ -66,7 +63,6 @@ def get_r2_client():
         return None
 
 def upload_stl_r2(file_bytes, original_filename):
-    """Upload un fichier STL vers R2. Retourne la clé ou None si échec."""
     client = get_r2_client()
     if not client:
         return None
@@ -86,19 +82,40 @@ def upload_stl_r2(file_bytes, original_filename):
         print(f"R2 upload failed: {e}")
         return None
 
+# ===================== CHARGEMENT MESH =====================
+
+def load_mesh(tmp_path, suffix):
+    """
+    Charge un fichier STL ou 3MF et retourne un trimesh.Trimesh unique.
+    - STL  : chargement direct
+    - 3MF  : retourne une Scene → on fusionne tous les géométries en un seul mesh
+    """
+    loaded = trimesh.load(tmp_path)
+
+    # Cas Scene (3MF multi-objets ou STL groupé)
+    if isinstance(loaded, trimesh.Scene):
+        meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not meshes:
+            raise ValueError("Aucune géométrie valide trouvée dans le fichier.")
+        mesh = trimesh.util.concatenate(meshes)
+    elif isinstance(loaded, trimesh.Trimesh):
+        mesh = loaded
+    else:
+        raise ValueError(f"Format non reconnu : {type(loaded)}")
+
+    # Réparation légère si nécessaire
+    if not mesh.is_watertight:
+        trimesh.repair.fix_normals(mesh)
+        trimesh.repair.fill_holes(mesh)
+
+    return mesh
+
 # ===================== CALCUL PRIX =====================
 
 def calculer_prix(mesh, materiau, echelle=1.0):
-    """
-    Calcule le prix en croisant :
-    - poids (matière × infill)
-    - temps d'impression estimé (volume / vitesse extrusion)
-    - occupation du plateau (supplément si >60%)
-    - warnings si hors plateau
-    """
-    densite    = DENSITE.get(materiau, 1.24)
-    vitesse    = VITESSE_MM3_S.get(materiau, 8.0)
-    prix_kg    = PRIX_KG.get(materiau, 25.0)
+    densite  = DENSITE.get(materiau, 1.24)
+    vitesse  = VITESSE_MM3_S.get(materiau, 8.0)
+    prix_kg  = PRIX_KG.get(materiau, 25.0)
 
     # — Dimensions & vérification plateau —
     bounds  = mesh.bounds
@@ -113,22 +130,22 @@ def calculer_prix(mesh, materiau, echelle=1.0):
     volume_cm3     = volume_mm3 / 1000.0
     surface_cm2    = (mesh.area * (echelle ** 2)) / 100.0
     volume_coque   = surface_cm2 * EPAISSEUR_COQUE
-    volume_imprime = (volume_cm3 * REMPLISSAGE) + volume_coque  # cm³ de matière réelle
+    volume_imprime = (volume_cm3 * REMPLISSAGE) + volume_coque
 
     # — Poids —
     poids_g = volume_imprime * densite
 
-    # — Temps d'impression (volume mm³ de matière / vitesse mm³/s) —
-    volume_mat_mm3  = volume_imprime * 1000.0   # cm³ → mm³
-    temps_secondes  = volume_mat_mm3 / vitesse
-    temps_heures    = temps_secondes / 3600.0
-    temps_label     = f"{int(temps_heures)}h{int((temps_heures % 1) * 60):02d}"
+    # — Temps d'impression —
+    volume_mat_mm3 = volume_imprime * 1000.0
+    temps_secondes = volume_mat_mm3 / vitesse
+    temps_heures   = temps_secondes / 3600.0
+    temps_label    = f"{int(temps_heures)}h{int((temps_heures % 1) * 60):02d}"
 
-    # — Surface plateau (empreinte XY) —
-    surface_xy      = dims_mm[0] * dims_mm[1]
-    surface_max     = PLATEAU["x"] * PLATEAU["y"]
-    ratio_plateau   = surface_xy / surface_max
-    suppl_plateau   = 0.50 if ratio_plateau > 0.60 else 0.0
+    # — Surface plateau —
+    surface_xy    = dims_mm[0] * dims_mm[1]
+    surface_max   = PLATEAU["x"] * PLATEAU["y"]
+    ratio_plateau = surface_xy / surface_max
+    suppl_plateau = 0.50 if ratio_plateau > 0.60 else 0.0
 
     # — Coûts —
     cout_matiere = (poids_g / 1000.0) * prix_kg
@@ -139,14 +156,14 @@ def calculer_prix(mesh, materiau, echelle=1.0):
     prix_final = max(round(prix_brut, 2), PRIX_MIN)
 
     return {
-        "prix_final_eur":       prix_final,
-        "prix_filament_eur":    round(cout_matiere, 2),
-        "poids_g":              round(poids_g, 1),
-        "volume_cm3":           round(volume_cm3, 2),
-        "volume_imprime_cm3":   round(volume_imprime, 2),
-        "temps_impression":     temps_label,
-        "surface_plateau_pct":  round(ratio_plateau * 100, 1),
-        "materiau":             materiau,
+        "prix_final_eur":      prix_final,
+        "prix_filament_eur":   round(cout_matiere, 2),
+        "poids_g":             round(poids_g, 1),
+        "volume_cm3":          round(volume_cm3, 2),
+        "volume_imprime_cm3":  round(volume_imprime, 2),
+        "temps_impression":    temps_label,
+        "surface_plateau_pct": round(ratio_plateau * 100, 1),
+        "materiau":            materiau,
         "dimensions_mm": {
             "largeur":    round(dims_mm[0], 1),
             "profondeur": round(dims_mm[1], 1),
@@ -181,25 +198,19 @@ def analyze():
     if suffix not in [".stl", ".3mf"]:
         return jsonify({"error": "Format non supporte. Utilisez .stl ou .3mf"}), 400
 
-    # Lire les bytes une seule fois (pour upload R2 + analyse)
     file_bytes = f.read()
-
-    # Upload R2 en arrière-plan (non bloquant si échec)
-    r2_key = upload_stl_r2(file_bytes, f.filename)
+    r2_key     = upload_stl_r2(file_bytes, f.filename)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
-        mesh = trimesh.load(tmp_path, force="mesh")
-        if not mesh.is_watertight:
-            trimesh.repair.fix_normals(mesh)
-            trimesh.repair.fill_holes(mesh)
-
+        mesh   = load_mesh(tmp_path, suffix)
         result = calculer_prix(mesh, materiau, echelle)
         result["watertight"] = mesh.is_watertight
-        result["r2_key"]     = r2_key  # None si R2 non configuré
+        result["r2_key"]     = r2_key
+        result["format"]     = suffix.lstrip(".")   # "stl" ou "3mf" — utile pour le frontend
 
         return jsonify(result)
 
@@ -221,22 +232,22 @@ def create_order():
     if not data:
         return jsonify({"error": "Donnees manquantes"}), 400
 
-    fichier           = data.get("fichier", "-")
-    lien              = data.get("lien", "-")
-    materiau          = data.get("materiau", "PLA")
-    couleur           = data.get("couleur", "-")
-    plaque            = data.get("plaque", "Aucune (lisse)")
-    finition          = data.get("finition", "Impression brute")
-    dimensions        = data.get("dimensions", "-")
-    temps_impression  = data.get("temps_impression", "-")
-    surface_plateau   = data.get("surface_plateau_pct", "-")
-    commentaire       = data.get("commentaire", "")
-    r2_key            = data.get("r2_key", "-")
-    prix              = float(data.get("prix", 3.0))
+    fichier          = data.get("fichier", "-")
+    lien             = data.get("lien", "-")
+    materiau         = data.get("materiau", "PLA")
+    couleur          = data.get("couleur", "-")
+    plaque           = data.get("plaque", "Aucune (lisse)")
+    finition         = data.get("finition", "Impression brute")
+    dimensions       = data.get("dimensions", "-")
+    temps_impression = data.get("temps_impression", "-")
+    surface_plateau  = data.get("surface_plateau_pct", "-")
+    commentaire      = data.get("commentaire", "")
+    r2_key           = data.get("r2_key", "-")
+    prix             = float(data.get("prix", 3.0))
 
     note = "\n".join([
         f"Fichier       : {fichier}",
-        f"Lien STL      : {lien}",
+        f"Lien fichier  : {lien}",
         f"Fichier R2    : {r2_key}",
         f"Matériau      : {materiau}",
         f"Couleur       : {couleur}",
@@ -256,22 +267,21 @@ def create_order():
                 "quantity": 1,
                 "requires_shipping": True,
                 "properties": [
-                    {"name": "Fichier",          "value": fichier},
-                    {"name": "Lien fichier",      "value": lien},
-                    {"name": "Matériau",          "value": materiau},
-                    {"name": "Couleur",           "value": couleur},
-                    {"name": "Plaque",            "value": plaque},
-                    {"name": "Finition",          "value": finition},
-                    {"name": "Dimensions",        "value": dimensions},
-                    {"name": "Temps impression",  "value": temps_impression},
-                    {"name": "Surface plateau",   "value": f"{surface_plateau}%"},
-                    {"name": "Fichier R2",        "value": r2_key or "-"},
-                    *([ {"name": "Commentaire", "value": commentaire} ] if commentaire else []),
+                    {"name": "Fichier",         "value": fichier},
+                    {"name": "Lien fichier",     "value": lien},
+                    {"name": "Matériau",         "value": materiau},
+                    {"name": "Couleur",          "value": couleur},
+                    {"name": "Plaque",           "value": plaque},
+                    {"name": "Finition",         "value": finition},
+                    {"name": "Dimensions",       "value": dimensions},
+                    {"name": "Temps impression", "value": temps_impression},
+                    {"name": "Surface plateau",  "value": f"{surface_plateau}%"},
+                    {"name": "Fichier R2",       "value": r2_key or "-"},
+                    *([ {"name": "Commentaire",  "value": commentaire} ] if commentaire else []),
                 ]
             }],
             "note": note,
             "tags": "impression-3d-custom,a-valider",
-            # Pas de send_receipt ni complete → reste en brouillon à valider manuellement
         }
     }
 
@@ -287,13 +297,10 @@ def create_order():
         with urllib.request.urlopen(req, timeout=15) as r:
             resp_data = json_lib.loads(r.read().decode())
 
-        invoice_url = resp_data["draft_order"].get("invoice_url", "")
-        order_name  = resp_data["draft_order"].get("name", "")
-
         return jsonify({
             "success":     True,
-            "invoice_url": invoice_url,
-            "order_name":  order_name,
+            "invoice_url": resp_data["draft_order"].get("invoice_url", ""),
+            "order_name":  resp_data["draft_order"].get("name", ""),
         })
 
     except urllib.error.HTTPError as e:
